@@ -14,8 +14,8 @@ in a fixed shuffled order, back to back, and recovers on its own after network d
 ## Using it
 - Press **▶ Start** once per browser (browsers require a click before playing sound).
 - The shuffle order is the same in every browser and only changes when you click **Reshuffle** (twice).
-- Your episode and position are saved in the browser and in the address bar.
-  To continue in another browser, click **🔗 Copy resume link** and open that link there.
+- Your episode and position are saved in Chrome's storage for this site (not in the URL or history).
+  Clearing this site's data, or using an Incognito window, starts from the beginning of the order.
 - If the connection drops, it resumes at the same spot when the connection returns.
   An episode that fails to load 5 times in a row is skipped.
 

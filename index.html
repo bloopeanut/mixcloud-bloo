@@ -45,7 +45,6 @@
       <button id="pauseBtn" disabled>⏸ Pause</button>
       <button id="skipBtn" disabled>⏭ Skip</button>
       <button id="shuffleBtn" disabled>🔀 Reshuffle</button>
-      <button id="linkBtn" disabled title="Copy a link that resumes this exact spot in any browser">🔗 Copy resume link</button>
     </div>
     <div id="status"><span class="dot" id="dot"></span><span id="statusText">Starting…</span></div>
   </div>
@@ -94,8 +93,6 @@
   function seededOrder(keys, seed) {
     return keys.map(k => [hash(seed + "|" + k), k]).sort((a, b) => a[0] - b[0] || (a[1] < b[1] ? -1 : 1)).map(x => x[1]);
   }
-  const slugOf = key => key.split("/").filter(Boolean)[1] || "";
-  const keyOf = slug => `/${USER}/${slug}/`;
 
   // ---------- State ----------
   let episodes = {};          // key -> {name, url, len}
@@ -118,7 +115,6 @@
     const key = currentKey(); if (!key) return;
     const t = Math.floor(resumePos);
     store.set(LS_STATE, { seed, key, resumePos: t });
-    try { history.replaceState(null, "", `#s=${seed}&e=${encodeURIComponent(slugOf(key))}&t=${t}`); } catch {}
   }
 
   // ---------- Episode list (fetch → JSONP fallback → cache) ----------
@@ -381,24 +377,6 @@
     setTimeout(() => { delete b.dataset.armed; b.textContent = "🔀 Reshuffle"; }, 4000);
     return false;
   }
-  $("linkBtn").onclick = async () => {
-    saveState(true);
-    const url = location.href;
-    try { await navigator.clipboard.writeText(url); setStatus("Resume link copied — paste it into any browser", "ok"); }
-    catch { prompt("Copy this link:", url); }
-  };
-  // Pasting a resume link into an already-open tab
-  window.addEventListener("hashchange", () => {
-    const h = readHash(); if (!h) return;
-    applyPosition(h.seed, h.key, h.t);
-    playCurrent(resumePos);
-  });
-  function readHash() {
-    const q = new URLSearchParams(location.hash.slice(1));
-    if (!q.has("s")) return null;
-    const sd = parseInt(q.get("s"), 10);
-    return Number.isFinite(sd) ? { seed: sd, key: q.get("e") ? keyOf(q.get("e")) : null, t: parseInt(q.get("t"), 10) || 0 } : null;
-  }
   function applyPosition(sd, key, t) {
     seed = sd;
     queue = seededOrder(Object.keys(episodes), seed);
@@ -414,14 +392,14 @@
     const keys = Object.keys(episodes);
     $("count").textContent = `${keys.length} episodes in rotation.`;
 
-    // Where to start: a resume link in the URL wins, then this browser's saved spot, then the default order.
-    const fromUrl = readHash();
+    // Where to start: this browser's saved spot, otherwise the default order.
+    // (Clear any old #s=… link left over from the previous version, once.)
+    if (location.hash) { try { history.replaceState(null, "", location.pathname + location.search); } catch {} }
     const saved = store.get(LS_STATE);
-    if (fromUrl) applyPosition(fromUrl.seed, fromUrl.key, fromUrl.t);
-    else if (saved && Number.isFinite(saved.seed)) applyPosition(saved.seed, saved.key, saved.resumePos || 0);
+    if (saved && Number.isFinite(saved.seed)) applyPosition(saved.seed, saved.key, saved.resumePos || 0);
     else applyPosition(DEFAULT_SEED, null, 0);
 
-    ["startBtn", "skipBtn", "shuffleBtn", "linkBtn"].forEach(id => $(id).disabled = false);
+    ["startBtn", "skipBtn", "shuffleBtn"].forEach(id => $(id).disabled = false);
     // Show the current episode in the widget without autoplaying (browsers need a click first)
     await playCurrent(resumePos);
     setStatus(resumePos > 5 ? `Ready — press Start to resume at ${Math.floor(resumePos/60)}m` : "Ready — press Start", "");
