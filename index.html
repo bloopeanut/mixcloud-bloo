@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Blue Bus — Shuffle Radio</title>
+<style>
+  :root { --bg:#0e1424; --panel:#16203a; --ink:#e8ecf6; --dim:#8d98b5; --accent:#4f8cff; --warn:#f2b84b; --bad:#ff6b6b; --ok:#5fd38d; }
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; background:radial-gradient(1200px 600px at 50% -10%, #1d2b52, var(--bg)); color:var(--ink);
+         font:15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; display:flex; justify-content:center; padding:32px 16px; }
+  main { width:100%; max-width:720px; }
+  h1 { font-size:22px; margin:0 0 4px; letter-spacing:.3px; }
+  .sub { color:var(--dim); margin:0 0 20px; font-size:13px; }
+  .card { background:var(--panel); border-radius:14px; padding:18px; margin-bottom:16px; box-shadow:0 6px 24px rgba(0,0,0,.25); }
+  .now-label { color:var(--dim); font-size:12px; text-transform:uppercase; letter-spacing:1px; }
+  #title { font-size:18px; font-weight:600; margin:2px 0 10px; min-height:27px; word-break:break-word; }
+  #title a { color:inherit; text-decoration:none; } #title a:hover { text-decoration:underline; }
+  #widgetBox { width:100%; height:120px; border-radius:8px; overflow:hidden; background:#0b1020; display:flex; align-items:center; justify-content:center; color:var(--dim); }
+  #widgetBox iframe { width:100%; height:120px; border:0; display:block; }
+  .controls { display:flex; gap:10px; margin-top:14px; flex-wrap:wrap; }
+  button { background:#24315a; color:var(--ink); border:0; border-radius:10px; padding:10px 16px; font:inherit; font-weight:600; cursor:pointer; }
+  button:hover { background:#2d3d70; } button:disabled { opacity:.45; cursor:default; }
+  button.primary { background:var(--accent); } button.primary:hover { background:#6a9eff; }
+  #status { margin-top:12px; font-size:13px; color:var(--dim); display:flex; align-items:center; gap:8px; }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--dim); flex:none; }
+  .dot.ok { background:var(--ok); } .dot.warn { background:var(--warn); } .dot.bad { background:var(--bad); }
+  h2 { font-size:13px; color:var(--dim); text-transform:uppercase; letter-spacing:1px; margin:0 0 8px; }
+  ol { margin:0; padding-left:22px; } li { padding:3px 0; }
+  li .len { color:var(--dim); font-size:12px; margin-left:6px; }
+  footer { color:var(--dim); font-size:12px; text-align:center; margin-top:8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>The Blue Bus — Shuffle Radio</h1>
+  <p class="sub">Random, continuous episodes from <a style="color:var(--accent)" href="https://www.mixcloud.com/thebluebus/uploads/" target="_blank" rel="noopener">mixcloud.com/thebluebus</a></p>
+
+  <div class="card">
+    <div class="now-label">Now playing</div>
+    <div id="title">—</div>
+    <div id="widgetBox">Loading episode list…</div>
+    <div class="controls">
+      <button id="startBtn" class="primary" disabled>▶ Start</button>
+      <button id="pauseBtn" disabled>⏸ Pause</button>
+      <button id="skipBtn" disabled>⏭ Skip</button>
+      <button id="shuffleBtn" disabled>🔀 Reshuffle</button>
+      <button id="linkBtn" disabled title="Copy a link that resumes this exact spot in any browser">🔗 Copy resume link</button>
+    </div>
+    <div id="status"><span class="dot" id="dot"></span><span id="statusText">Starting…</span></div>
+  </div>
+
+  <div class="card">
+    <h2>Up next</h2>
+    <ol id="upNext"><li style="color:var(--dim)">…</li></ol>
+  </div>
+
+  <footer><span id="count"></span> Playback uses Mixcloud’s official widget.</footer>
+</main>
+
+<script>
+(() => {
+  "use strict";
+
+  // ---------- Config ----------
+  const USER = "thebluebus";
+  const API_FIRST = `https://api.mixcloud.com/${USER}/cloudcasts/?limit=100`;
+  const WIDGET_API_SRC = "https://widget.mixcloud.com/media/js/widgetApi.js";
+  const WIDGET_IFRAME = "https://player-widget.mixcloud.com/widget/iframe/";
+  const DEFAULT_SEED = 1;                 // every browser starts from this same shuffle
+  const LIST_TTL_MS = 12 * 3600 * 1000;   // re-fetch episode list twice a day
+  const STALL_MS = 15000;                 // no progress this long while playing = stalled
+  const WATCH_EVERY_MS = 3000;
+  const LS_LIST = "bluebus.list.v1", LS_STATE = "bluebus.state.v2";
+
+  // ---------- Tiny helpers ----------
+  const $ = id => document.getElementById(id);
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const store = {
+    get(k) { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } },
+    set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
+  };
+  const fmtLen = s => { if (!s) return ""; const h = Math.floor(s/3600), m = Math.round((s%3600)/60); return h ? `${h}h ${m}m` : `${m}m`; };
+  function setStatus(text, level = "") { $("statusText").textContent = text; $("dot").className = "dot " + level; }
+  // Stable hash (cyrb53). Each episode's spot in the order = hash(seed + key), so the order is
+  // identical in every browser for a given seed, and new uploads slot in without disturbing the rest.
+  function hash(str) {
+    let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+    for (let i = 0; i < str.length; i++) { const c = str.charCodeAt(i); h1 = Math.imul(h1 ^ c, 2654435761); h2 = Math.imul(h2 ^ c, 1597334677); }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return 4294967296 * (2097151 & h2) + (h1 >>> 0);
+  }
+  function seededOrder(keys, seed) {
+    return keys.map(k => [hash(seed + "|" + k), k]).sort((a, b) => a[0] - b[0] || (a[1] < b[1] ? -1 : 1)).map(x => x[1]);
+  }
+  const slugOf = key => key.split("/").filter(Boolean)[1] || "";
+  const keyOf = slug => `/${USER}/${slug}/`;
+
+  // ---------- State ----------
+  let episodes = {};          // key -> {name, url, len}
+  let seed = DEFAULT_SEED;    // which shuffle order we're on (changes only via Reshuffle)
+  let queue = [];             // episode keys in shuffle order
+  let idx = 0;                // position in queue
+  let resumePos = 0;          // seconds into current episode (persisted)
+  let wantPlaying = false;    // user intent
+  let widget = null, gen = 0; // current widget + generation (ignore stale events)
+  let lastProgressAt = 0, lastPos = -1, duration = 0;
+  let pendingSeek = 0;        // seek to this once playback actually starts
+  let recovering = false, recoverAttempts = 0, lastSave = 0;
+
+  const currentKey = () => queue[idx];
+
+  function saveState(force) {
+    const now = Date.now();
+    if (!force && now - lastSave < 4000) return;
+    lastSave = now;
+    const key = currentKey(); if (!key) return;
+    const t = Math.floor(resumePos);
+    store.set(LS_STATE, { seed, key, resumePos: t });
+    try { history.replaceState(null, "", `#s=${seed}&e=${encodeURIComponent(slugOf(key))}&t=${t}`); } catch {}
+  }
+
+  // ---------- Episode list (fetch → JSONP fallback → cache) ----------
+  function jsonp(url, timeout = 15000) {
+    return new Promise((resolve, reject) => {
+      const cb = "__mc_cb_" + Math.random().toString(36).slice(2);
+      const s = document.createElement("script");
+      const t = setTimeout(() => { cleanup(); reject(new Error("JSONP timeout")); }, timeout);
+      function cleanup() { clearTimeout(t); delete window[cb]; s.remove(); }
+      window[cb] = data => { cleanup(); resolve(data); };
+      s.onerror = () => { cleanup(); reject(new Error("JSONP failed")); };
+      s.src = url + (url.includes("?") ? "&" : "?") + "callback=" + cb;
+      document.head.appendChild(s);
+    });
+  }
+  async function getJSON(url) {
+    try {
+      const r = await fetch(url, { cache: "no-store" });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return await r.json();
+    } catch (e) {
+      return await jsonp(url); // in case CORS is ever refused
+    }
+  }
+  async function fetchAllEpisodes() {
+    const out = {};
+    let url = API_FIRST, pages = 0;
+    while (url && pages < 200) {
+      const page = await getJSON(url);
+      for (const c of page.data || []) {
+        out[c.key] = { name: c.name, url: c.url, len: c.audio_length || 0 };
+      }
+      url = page.paging && page.paging.next;
+      pages++;
+      setStatus(`Loading episode list… ${Object.keys(out).length} found`);
+    }
+    if (!Object.keys(out).length) throw new Error("No episodes returned");
+    return out;
+  }
+  async function loadEpisodes() {
+    const cached = store.get(LS_LIST);
+    if (cached && cached.eps && Date.now() - cached.at < LIST_TTL_MS) return cached.eps;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const eps = await fetchAllEpisodes();
+        store.set(LS_LIST, { at: Date.now(), eps });
+        return eps;
+      } catch (e) {
+        if (cached && cached.eps) { console.warn("Using cached list:", e); return cached.eps; }
+        const wait = Math.min(30, 3 * 2 ** attempt);
+        const sandboxed = (() => { try { return window.top !== window.self; } catch { return true; } })();
+        setStatus(!navigator.onLine ? "Offline — waiting for connection…"
+          : sandboxed ? `Couldn’t reach Mixcloud — this preview may block network access. Open the page in a normal browser tab. Retrying in ${wait}s…`
+          : `Couldn’t load episodes, retrying in ${wait}s…`, "bad");
+        await waitOnlineOr(wait * 1000);
+      }
+    }
+  }
+  function waitOnlineOr(ms) {
+    return new Promise(res => {
+      const done = () => { clearTimeout(t); window.removeEventListener("online", done); res(); };
+      const t = setTimeout(done, ms);
+      window.addEventListener("online", done);
+    });
+  }
+
+  // ---------- Mixcloud widget API ----------
+  let apiPromise = null;
+  function loadWidgetApi() {
+    if (window.Mixcloud && window.Mixcloud.PlayerWidget) return Promise.resolve();
+    if (apiPromise) return apiPromise;
+    apiPromise = new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = WIDGET_API_SRC; s.async = true;
+      s.onload = () => resolve();
+      s.onerror = () => { s.remove(); apiPromise = null; reject(new Error("widget API failed to load")); };
+      document.head.appendChild(s);
+    });
+    return apiPromise;
+  }
+
+  function withTimeout(p, ms, msg) {
+    return Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms))]);
+  }
+
+  // Build a fresh iframe + widget for `key`. Used initially and for hard recovery.
+  async function buildWidget(key, autoplay) {
+    await loadWidgetApi();
+    const myGen = ++gen;
+    const box = $("widgetBox");
+    box.innerHTML = "";
+    const f = document.createElement("iframe");
+    f.allow = "autoplay; encrypted-media";
+    f.src = `${WIDGET_IFRAME}?hide_cover=1&hide_artwork=1&autoplay=${autoplay ? 1 : 0}&feed=${encodeURIComponent(key)}`;
+    box.appendChild(f);
+    const w = Mixcloud.PlayerWidget(f);
+    await withTimeout(w.ready, 60000, "widget not ready");
+    if (myGen !== gen) return;
+    widget = w;
+    bindEvents(w, myGen);
+    if (autoplay) { try { await w.play(); } catch {} }
+  }
+
+  function bindEvents(w, myGen) {
+    const live = () => myGen === gen;
+    w.events.progress.on((pos, dur) => {
+      if (!live()) return;
+      if (dur) duration = dur;
+      if (pendingSeek && pos < pendingSeek - 5) {
+        const target = pendingSeek; pendingSeek = 0;
+        w.seek(target).catch(() => {});
+        return;
+      }
+      pendingSeek = 0;
+      if (pos !== lastPos) {
+        lastPos = pos; lastProgressAt = Date.now();
+        resumePos = pos;
+        if (recovering || recoverAttempts) { recovering = false; recoverAttempts = 0; }
+        if (wantPlaying) setStatus("Playing", "ok");
+        saveState();
+      }
+    });
+    w.events.play.on(() => { if (!live()) return; wantPlaying = true; lastProgressAt = Date.now(); syncButtons(); });
+    w.events.pause.on(() => {
+      if (!live() || recovering) return;
+      // A pause while online and not stalled = the user paused (possibly via the widget's own button)
+      if (navigator.onLine && Date.now() - lastProgressAt < STALL_MS) {
+        wantPlaying = false; setStatus("Paused"); syncButtons(); saveState(true);
+      }
+    });
+    w.events.buffering.on(() => { if (live() && wantPlaying) setStatus("Buffering…", "warn"); });
+    w.events.ended.on(() => {
+      if (!live()) return;
+      // Guard against a network failure masquerading as "ended"
+      if (duration && resumePos < duration - 30) { console.warn("Early 'ended' — treating as stall"); recover(); return; }
+      next();
+    });
+    if (w.events.error) w.events.error.on(e => { if (live()) { console.warn("widget error", e); if (wantPlaying) recover(); } });
+  }
+
+  // ---------- Playback ----------
+  async function playCurrent(startAt = 0) {
+    const key = currentKey();
+    const ep = episodes[key] || { name: key, url: "https://www.mixcloud.com" + key };
+    $("title").innerHTML = "";
+    const a = document.createElement("a"); a.href = ep.url; a.target = "_blank"; a.rel = "noopener"; a.textContent = ep.name;
+    $("title").appendChild(a);
+    document.title = `${ep.name} — The Blue Bus`;
+    renderUpNext();
+    recoverAttempts = 0;
+    resumePos = startAt; lastPos = -1; duration = ep.len || 0; pendingSeek = startAt > 5 ? startAt : 0;
+    lastProgressAt = Date.now();
+    saveState(true);
+    setStatus("Loading episode…", "warn");
+    try {
+      if (widget && typeof widget.load === "function") {
+        await withTimeout(widget.load(key, wantPlaying), 45000, "load timeout");
+        if (wantPlaying) { try { await widget.play(); } catch {} }
+      } else {
+        await buildWidget(key, wantPlaying);
+      }
+    } catch (e) {
+      console.warn("playCurrent failed:", e);
+      if (wantPlaying) recover(); else setStatus("Couldn’t load the player — check connection", "bad");
+    }
+    if (!wantPlaying) setStatus("Ready — press Start", "");
+  }
+
+  function next() {
+    idx++;
+    if (idx >= queue.length) idx = 0;   // start the same order over; only Reshuffle changes it
+    playCurrent(0);
+  }
+
+  // Recovery: first try a gentle seek/play; if that doesn't revive progress, rebuild the iframe.
+  async function recover() {
+    if (recovering) return;
+    if (!navigator.onLine) { setStatus("Offline — will resume when the connection returns", "bad"); return; }
+    // Same episode keeps failing while we're online → it's probably the episode, not the network. Move on.
+    if (recoverAttempts >= 5) {
+      console.warn("Episode won't play after 5 tries, skipping:", currentKey());
+      recoverAttempts = 0;
+      setStatus("That episode wouldn’t load — skipping to the next one", "warn");
+      next();
+      return;
+    }
+    recovering = true;
+    const attempt = recoverAttempts++;
+    const pos = Math.max(0, resumePos - 3);
+    setStatus(attempt ? `Reconnecting (attempt ${attempt + 1})…` : "Connection hiccup — resuming…", "warn");
+    try {
+      if (attempt === 0 && widget) {
+        try { await withTimeout(widget.seek(pos), 5000, "seek timeout"); } catch {}
+        try { await withTimeout(widget.play(), 5000, "play timeout"); } catch {}
+      } else {
+        await sleep(Math.min(30000, 2000 * attempt));
+        if (!navigator.onLine) { recovering = false; return; }
+        apiPromise = (window.Mixcloud && window.Mixcloud.PlayerWidget) ? apiPromise : null;
+        pendingSeek = pos > 5 ? pos : 0;
+        await buildWidget(currentKey(), true);
+      }
+    } catch (e) { console.warn("recover failed:", e); }
+    lastProgressAt = Date.now();  // give it a full STALL_MS window before the watchdog tries again
+    recovering = false;
+    if (recoverAttempts >= 3) setStatus("Still reconnecting… if nothing plays, press ▶ in the player", "warn");
+  }
+
+  // Watchdog: notices silent stalls (network drop mid-stream, frozen widget, etc.)
+  setInterval(() => {
+    if (!wantPlaying || recovering) return;
+    if (!navigator.onLine) { setStatus("Offline — will resume when the connection returns", "bad"); return; }
+    if (Date.now() - lastProgressAt > STALL_MS) recover();
+  }, WATCH_EVERY_MS);
+
+  window.addEventListener("online", () => {
+    if (!wantPlaying) return;
+    setStatus("Back online — resuming…", "warn");
+    recoverAttempts = Math.max(recoverAttempts, 1); // go straight to a full rebuild
+    setTimeout(recover, 1500);
+  });
+  window.addEventListener("offline", () => { if (wantPlaying) setStatus("Offline — will resume when the connection returns", "bad"); });
+  window.addEventListener("pagehide", () => saveState(true));
+
+  // ---------- UI ----------
+  function syncButtons() {
+    $("startBtn").textContent = wantPlaying ? "▶ Playing" : "▶ Start";
+    $("startBtn").disabled = wantPlaying;
+    $("pauseBtn").disabled = !wantPlaying;
+  }
+  function renderUpNext() {
+    const ol = $("upNext"); ol.innerHTML = "";
+    for (let i = 1; i <= 6 && i < queue.length; i++) {
+      const ep = episodes[queue[(idx + i) % queue.length]]; if (!ep) continue;
+      const li = document.createElement("li");
+      li.textContent = ep.name;
+      const s = document.createElement("span"); s.className = "len"; s.textContent = fmtLen(ep.len); li.appendChild(s);
+      ol.appendChild(li);
+    }
+  }
+
+  $("startBtn").onclick = async () => {
+    wantPlaying = true; syncButtons();
+    lastProgressAt = Date.now();
+    if (!widget) { pendingSeek = resumePos > 5 ? resumePos : 0; try { await buildWidget(currentKey(), true); } catch { recover(); } return; }
+    if (pendingSeek === 0 && resumePos > 5 && lastPos < 0) pendingSeek = resumePos;
+    try { await widget.play(); } catch { recover(); }
+  };
+  $("pauseBtn").onclick = () => { wantPlaying = false; syncButtons(); setStatus("Paused"); if (widget) widget.pause().catch(() => {}); saveState(true); };
+  $("skipBtn").onclick = () => { wantPlaying = true; syncButtons(); next(); };
+  $("shuffleBtn").onclick = () => {
+    if (!confirmReshuffle()) return;
+    seed = 2 + Math.floor(Math.random() * 1e9);
+    queue = seededOrder(Object.keys(episodes), seed); idx = 0;
+    wantPlaying = true; syncButtons(); playCurrent(0);
+  };
+  function confirmReshuffle() {
+    const b = $("shuffleBtn");
+    if (b.dataset.armed) { delete b.dataset.armed; b.textContent = "🔀 Reshuffle"; return true; }
+    b.dataset.armed = "1"; b.textContent = "Click again to reshuffle";
+    setTimeout(() => { delete b.dataset.armed; b.textContent = "🔀 Reshuffle"; }, 4000);
+    return false;
+  }
+  $("linkBtn").onclick = async () => {
+    saveState(true);
+    const url = location.href;
+    try { await navigator.clipboard.writeText(url); setStatus("Resume link copied — paste it into any browser", "ok"); }
+    catch { prompt("Copy this link:", url); }
+  };
+  // Pasting a resume link into an already-open tab
+  window.addEventListener("hashchange", () => {
+    const h = readHash(); if (!h) return;
+    applyPosition(h.seed, h.key, h.t);
+    playCurrent(resumePos);
+  });
+  function readHash() {
+    const q = new URLSearchParams(location.hash.slice(1));
+    if (!q.has("s")) return null;
+    const sd = parseInt(q.get("s"), 10);
+    return Number.isFinite(sd) ? { seed: sd, key: q.get("e") ? keyOf(q.get("e")) : null, t: parseInt(q.get("t"), 10) || 0 } : null;
+  }
+  function applyPosition(sd, key, t) {
+    seed = sd;
+    queue = seededOrder(Object.keys(episodes), seed);
+    const i = key ? queue.indexOf(key) : -1;
+    idx = i >= 0 ? i : 0;
+    resumePos = i >= 0 ? t : 0;
+  }
+
+  // ---------- Boot ----------
+  (async function init() {
+    setStatus("Loading episode list…", "warn");
+    episodes = await loadEpisodes();
+    const keys = Object.keys(episodes);
+    $("count").textContent = `${keys.length} episodes in rotation.`;
+
+    // Where to start: a resume link in the URL wins, then this browser's saved spot, then the default order.
+    const fromUrl = readHash();
+    const saved = store.get(LS_STATE);
+    if (fromUrl) applyPosition(fromUrl.seed, fromUrl.key, fromUrl.t);
+    else if (saved && Number.isFinite(saved.seed)) applyPosition(saved.seed, saved.key, saved.resumePos || 0);
+    else applyPosition(DEFAULT_SEED, null, 0);
+
+    ["startBtn", "skipBtn", "shuffleBtn", "linkBtn"].forEach(id => $(id).disabled = false);
+    // Show the current episode in the widget without autoplaying (browsers need a click first)
+    await playCurrent(resumePos);
+    setStatus(resumePos > 5 ? `Ready — press Start to resume at ${Math.floor(resumePos/60)}m` : "Ready — press Start", "");
+
+    // Refresh the episode list in the background if the cache is stale
+    const c = store.get(LS_LIST);
+    if (!c || Date.now() - c.at >= LIST_TTL_MS) {
+      fetchAllEpisodes().then(eps => { store.set(LS_LIST, { at: Date.now(), eps }); Object.assign(episodes, eps);
+        const cur = currentKey(); queue = seededOrder(Object.keys(episodes), seed);
+        idx = Math.max(0, queue.indexOf(cur)); renderUpNext();
+        $("count").textContent = `${queue.length} episodes in rotation.`; }).catch(() => {});
+    }
+  })();
+})();
+</script>
+</body>
+</html>
